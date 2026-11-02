@@ -101,3 +101,26 @@ formProducto.addEventListener("submit", agregarProducto);
 
 
 formProducto.addEventListener("submit", agregarProducto);
+
+// Función para simular la compra desde la interfaz
+async function comprarRelampago(id_producto) {
+    try {
+        const respuesta = await fetch(`${API_URL}/${id_producto}`, { 
+            method: "POST",
+            headers: {"Content-Type": "application/json"}
+        });
+        
+        const data = await respuesta.json();
+        
+        if(respuesta.ok) {
+            alert("¡Éxito! " + data.mensaje);
+        } else {
+            alert("Fallo la compra: " + data.detail);
+        }
+        // Actualizar la tabla después del intento
+        await cargarProductos();
+    } catch (error) {
+        console.error("Error en la compra:", error);
+        alert("Error de conexión");
+    }
+}
