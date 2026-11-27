@@ -37,10 +37,13 @@ async function cargarProductos() {
                     <span class="badge ${p.cantidad < 10 ? 'bg-danger' : 'bg-success'}">
                         ${p.cantidad} unidades
                     </span>
+                
                 </td>
-                <td class="text-end">
-                    
-                    <button class="btn btn-outline-primary btn-sm me-2" onclick="comprarRelampago(${p.id})">
+                    <td class="text-end">
+                        <div class="d-inline-flex align-items-center me-2">
+                            <input type="number" id="cant-${p.id}" value="1" min="1" max"=${p.cantidad}"
+                                class="form-control form-control-sm me-1" style="width: 65px;">
+                    <button class="btn btn-outline-primary btn-sm me-2" onclick="comprarVarios(${p.id})">
                         <i class="bi bi-cart"></i> Comprar
                     </button>
 
@@ -107,12 +110,15 @@ document.addEventListener("DOMContentLoaded", async () => {
 formProducto.addEventListener("submit", agregarProducto);
 
 
-formProducto.addEventListener("submit", agregarProducto);
-
+function comprarVarios(id_producto) {
+    const input = document.getElementById(`cant-${id_producto}`);
+    const cantidad = parseInt(input.value, 10) || 1;
+    comprarRelampago(id_producto, cantidad);
+}
 // Función para simular la compra desde la interfaz
-async function comprarRelampago(id_producto) {
+async function comprarRelampago(id_producto, cantidad = 1) {
     try {
-        const respuesta = await fetch(`${API_URL}/${id_producto}`, { 
+        const respuesta = await fetch(`${API_URL}/${id_producto}?cantidad=${cantidad}`, { 
             method: "POST",
             headers: {"Content-Type": "application/json"}
         });
@@ -135,19 +141,22 @@ async function comprarRelampago(id_producto) {
 
 async function cargarDashboard() {
     // Cargar KPIs
-    const resKpi = await fetch("http://127.0.0.1:8000/api/kpis");
+    const resKpi = await fetch("http://127.0.0.1:8000/api/analisis/kpis");
     const kpis = await resKpi.json();
     
     // Asumiendo que tienes elementos HTML con estos IDs en tu index.html
-    document.getElementById("kpiIngresos").textContent = `$${kpis.ingresos_totales}`;
-    document.getElementById("kpiTransacciones").textContent = kpis.total_transacciones;
+    document.getElementById("kpiIngresos").textContent = `$${Number(kpis.ingresos_totales).toLocaleString("es-MX", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+    })}`;
+    document.getElementById("kpiTransacciones").textContent = Number(kpis.total_transacciones).toLocaleString("es-MX");
     document.getElementById("kpiEstrella").textContent = `ID: ${kpis.producto_estrella}`;
 
     // Cargar Gráfica
-    const resGraf = await fetch("http://127.0.0.1:8000/api/graficas");
+    const resGraf = await fetch("http://127.0.0.1:8000/api/analisis/mas-vendidos");
     const datosGraf = await resGraf.json();
     
-    renderizarGrafica(datosGraf.ventas_por_producto, datosGraf.v);
+    renderizarGrafica(datosGraf.ventas_por_producto, datosGraf.ventas_por_fecha);
 }
 
 // Agregamos "= {}" como valor por defecto por si los datos fallan
@@ -160,7 +169,7 @@ function renderizarGrafica(datosBarras = {}, datosLineas = {}) {
     miGrafica = new Chart(ctx, {
         type: 'bar',
         data: {
-            labels: Object.keys(datosBarras).map(id => `Prod ${id}`),
+            labels: Object.keys(datosBarras),
             datasets: [{
                 label: 'Ingresos por Producto ($)',
                 data: Object.values(datosBarras),

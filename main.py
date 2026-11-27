@@ -3,22 +3,73 @@ import asyncio
 from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pydantic import BaseModel, Field
 from typing import List
 import pandas as pd
 import csv
 from datetime import datetime
 import os
+from contextlib import asynccontextmanager
+import polars as pl
+
 
 # ELIMINAR la lista 'inventario = [...]'
 # Asegurar que existan los archivos base
+lock = asyncio.Lock()
+
+COLUMNAS_VENTAS = ["id_venta", "fecha", "producto", "precio", "cantidad", "monto_total"]
+
 if not os.path.exists("productos.csv"):
     pd.DataFrame(columns=["id", "nombre", "precio", "cantidad"]).to_csv("productos.csv", index=False)
 if not os.path.exists("ventas.csv"):
-    pd.DataFrame(columns=["fecha", "producto_id", "precio", "cantidad", "monto_total"]).to_csv("ventas.csv", index=False)
+    pd.DataFrame(columns=COLUMNAS_VENTAS).to_csv("ventas.csv", index=False)
 
+SCHEMA_VENTAS = {
+    "id_venta": pl.Int64,
+    "fecha": pl.Utf8,
+    "producto": pl.Utf8,
+    "precio": pl.Float64,
+    "cantidad": pl.Int64,
+    "monto_total": pl.Float64,
+}
 
-app = FastAPI(title="API Proyecto Tiendita")
+async def corte_de_caja():
+    async with lock:
+        if not os.path.exists("ventas.csv"):
+            return
+        try:
+            df_csv = pl.read_csv("ventas.csv", schema=SCHEMA_VENTAS, encoding="utf8-lossy")
+            if df_csv.is_empty():
+                print("[Corte de Caja] Sin ventas nuevas en turno.")
+                return
+
+            if os.path.exists("ventas.parquet"):
+                df_parquet = pl.read_parquet("ventas.parquet")
+                df_final = pl.concat([df_parquet, df_csv])
+            else:
+                df_final = df_csv
+
+            # Guardar Parquet actualizado y vaciar CSV dejando solo encabezados
+            df_final.write_parquet("ventas.parquet")
+            with open("ventas.csv", "w", encoding="utf-8") as f:
+                f.write(",".join(COLUMNAS_VENTAS) + "\n")
+
+            print(f"[Corte de Caja] {df_csv.height} ventas archivadas en ventas.parquet.")
+        except Exception as e:
+            print(f"[Corte de Caja] Error: {e}")
+
+# --- CICLO DE VIDA (LIFESPAN) DE FASTAPI ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = AsyncIOScheduler()
+    # Configurado cada 2 minutos para demostración en clase
+    scheduler.add_job(corte_de_caja, "interval", minutes=2)
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(title="API Proyecto Tiendita", lifespan=lifespan)
 
 
 app.add_middleware(
@@ -28,10 +79,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
-
-# Cerrojo para sincronización asíncrona 
-lock = asyncio.Lock()
-
 
 
 '''inventario = [
@@ -77,20 +124,39 @@ async def getProductoEspecifico(id: int):
 # Agregar producto
 
 @app.post("/productos", response_model=respuestaProducto, status_code=status.HTTP_201_CREATED)
-def addProducto(producto: crearProducto):
-    df = pd.read_csv("productos.csv", encoding="latin1")
-    nuevo_id = int(df["id"].max() + 1) if not df.empty else 1
-    nuevo_producto = {
-        "id": nuevo_id, 
-        "nombre": producto.nombre, 
-        "precio": producto.precio, 
-        "cantidad": producto.cantidad
-    }
-    
-    df.loc[len(df)] = nuevo_producto
-    df.to_csv("productos.csv", index=False, encoding="latin1")
-    return nuevo_producto
+async def addProducto(producto: crearProducto):
+    async with lock:
+        df = pd.read_csv("productos.csv", encoding="latin1")
+        nombre_limpio = producto.nombre.strip().lower()
 
+        # Buscar si ya existe un producto con el mismo nombre
+        coincidencia = df[df["nombre"].astype(str).str.strip().str.lower() == nombre_limpio]
+
+        if not coincidencia.empty:
+            idx = coincidencia.index[0]
+            df.at[idx, "cantidad"] = int(df.at[idx, "cantidad"]) + producto.cantidad
+            df.at[idx, "precio"] = producto.precio
+            df.to_csv("productos.csv", index=False, encoding="latin1")
+
+            return {
+                "id": int(df.at[idx, "id"]),
+                "nombre": str(df.at[idx, "nombre"]),
+                "precio": float(df.at[idx, "precio"]),
+                "cantidad": int(df.at[idx, "cantidad"]),
+            }
+
+        # Si no existe, se crea uno nuevo
+        nuevo_id = int(df["id"].max() + 1) if not df.empty else 1
+        nuevo_producto = {
+            "id": nuevo_id,
+            "nombre": producto.nombre.strip(),
+            "precio": producto.precio,
+            "cantidad": producto.cantidad,
+        }
+
+        df.loc[len(df)] = nuevo_producto
+        df.to_csv("productos.csv", index=False, encoding="latin1")
+        return nuevo_producto
 
 #Eliminar producto
 
@@ -104,8 +170,11 @@ def deleteProducto(producto_id: int):
     return {"Message": "El producto fue eliminado"}
 
 @app.post("/productos/{producto_id}")
-async def comprar_producto(producto_id: int):
+async def comprar_producto(producto_id: int, cantidad: int= 1):
     try:
+        if cantidad <= 0:
+            raise HTTPException(400, "La cantidad debe ser mayor a 0")
+        
         async with lock:
             df_prod = pd.read_csv("productos.csv", encoding="latin1")
             
@@ -113,70 +182,100 @@ async def comprar_producto(producto_id: int):
                 raise HTTPException(400, "Producto no existe")
                 
             idx = df_prod.index[df_prod["id"] == producto_id].tolist()[0]
-            if df_prod.at[idx, "cantidad"] > 0:
-                df_prod.at[idx, "cantidad"] -= 1
+            stock_actual = int(df_prod.at[idx, "cantidad"])
+
+            if stock_actual >= cantidad:
+                df_prod.at[idx, "cantidad"] = stock_actual - cantidad
                 df_prod.to_csv("productos.csv", index=False, encoding="latin1")
                 
-                # Registrar en ventas.csv
+                precio_unit = float(df_prod.at[idx, "precio"])
+                
                 nueva_venta = {
+                    "id_venta": int(time.time() * 1000),
                     "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "producto_id": producto_id,
-                    "precio": df_prod.at[idx, "precio"],
-                    "cantidad": 1,
-                    "monto_total": df_prod.at[idx, "precio"]
+                    "producto": str(df_prod.at[idx, "nombre"]),
+                    "precio": precio_unit,
+                    "cantidad": cantidad,
+                    "monto_total": round(precio_unit * cantidad, 2)
                 }
                 # Guardamos la venta
-                pd.DataFrame([nueva_venta]).to_csv("ventas.csv", mode='a', header=not os.path.exists("ventas.csv"), index=False, encoding="latin1")
+                existe = os.path.exists("ventas.csv") and os.path.getsize("ventas.csv") > 0 
+                pd.DataFrame([nueva_venta]).to_csv(
+                    "ventas.csv", mode='a', header=not existe, index=False, encoding="utf-8"
+                )
+
                 
-                return {"mensaje": "Producto comprado exitosamente"}
+                return {"mensaje": f"Tu producto se compró exitosamente: {cantidad} unidad(es)"}
             else:
-                raise HTTPException(400, "No hay stock")
+                raise HTTPException(400, f"Stock insuficiente (disponible: {stock_actual})")
     except HTTPException:
         raise
     except Exception as error:
         # Esto atrapará cualquier error de Python y lo enviará al navegador
         raise HTTPException(500, f"Error interno: {str(error)}")
 
-@app.get("/api/kpis")
+@app.get("/api/analisis/kpis")
 def obtener_kpis():
     try:
-        df_ventas = pd.read_csv("ventas.csv", encoding="latin1")
-        if df_ventas.empty: return {"ingresos_totales": 0, "total_transacciones": 0, "producto_estrella": "N/A"}
-        
-        ingresos = df_ventas["monto_total"].sum()
-        transacciones = len(df_ventas)
-        prod_estrella = df_ventas["producto_id"].value_counts().idxmax()
-        
-        return {
-            "ingresos_totales": float(ingresos),
-            "total_transacciones": int(transacciones),
-            "producto_estrella": int(prod_estrella)
-        }
+            lf = obtener_ventas_combinadas()
+            resumen = lf.select([
+                pl.col("monto_total").sum().alias("ingresos_totales"),
+                pl.len().alias("total_transacciones"),
+            ]).collect()
+
+            estrella = (
+                lf.group_by("producto")
+                .agg(pl.col("cantidad").sum().alias("total_vendido"))
+                .sort("total_vendido", descending=True)
+                .limit(1)
+                .collect()
+            )
+
+            return {
+                "ingresos_totales": round(resumen["ingresos_totales"][0] or 0.0, 2),
+                "total_transacciones": int(resumen["total_transacciones"][0] or 0),
+                "producto_estrella": estrella["producto"][0] if not estrella.is_empty() else "N/A",
+            }
     except Exception as e:
-        return {"error": str(e)}
+            return {"error": str(e)}
 
 
-@app.get("/api/graficas")
+@app.get("/api/analisis/mas-vendidos")
 def obtener_datos_graficas():
     try:
-        df_ventas = pd.read_csv("ventas.csv", encoding="latin1")
-        
-        # Si el archivo está vacío (no hay ventas aún)
-        if df_ventas.empty: 
-            return {"ventas_por_producto": {}, "ventas_por_fecha": {}}
-        
-        # 1. Agrupar por producto
-        agrupado_prod = df_ventas.groupby("producto_id")["monto_total"].sum().to_dict()
-        
-        # 2. Agrupar por fecha
-        df_ventas['fecha_corta'] = pd.to_datetime(df_ventas['fecha']).dt.date.astype(str)
-        agrupado_fecha = df_ventas.groupby("fecha_corta")["monto_total"].sum().to_dict()
+            lf = obtener_ventas_combinadas()
 
-        # AQUÍ ESTÁ LA CLAVE: Se envían ambos diccionarios
-        return {
-            "ventas_por_producto": agrupado_prod,
-            "ventas_por_fecha": agrupado_fecha
-        }
+            por_producto = (
+                lf.group_by("producto")
+                .agg(pl.col("monto_total").sum().alias("ingresos"))
+                .sort("ingresos", descending=True)
+                .collect()
+                .to_dicts()
+            )
+
+            por_fecha = (
+                lf.with_columns(pl.col("fecha").str.slice(0, 10).alias("fecha_corta"))
+                .group_by("fecha_corta")
+                .agg(pl.col("monto_total").sum().alias("ingresos"))
+                .sort("fecha_corta")
+                .collect()
+                .to_dicts()
+            )
+
+            return {
+                "ventas_por_producto": {r["producto"]: round(r["ingresos"], 2) for r in por_producto},
+                "ventas_por_fecha": {r["fecha_corta"]: round(r["ingresos"], 2) for r in por_fecha},
+            }
     except Exception as e:
-        # Si hay un error, lo enviamos para saber qué pasó
-        return {"error": str(e)}
+            return {"error": str(e)}
+
+def obtener_ventas_combinadas() -> pl.LazyFrame:
+    frames = []
+    if os.path.exists("ventas.parquet"):
+        frames.append(pl.scan_parquet("ventas.parquet"))
+    if os.path.exists("ventas.csv") and os.path.getsize("ventas.csv") > 0:
+        frames.append(pl.scan_csv("ventas.csv", schema=SCHEMA_VENTAS, encoding="utf8-lossy"))
+    
+    if not frames:
+        return pl.DataFrame(schema=SCHEMA_VENTAS).lazy()
+    return pl.concat(frames)
